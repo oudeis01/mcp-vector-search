@@ -14,6 +14,17 @@ The two are independent: `docs-search` is self-contained, and `project-rag-cli` 
 - The `project-rag` binary on `PATH` (for code search) — build it from the [fork](https://github.com/oudeis01/project-rag)
 - Optional: an NVIDIA GPU + CUDA for accelerated embedding
 
+### Why a fork of project-rag?
+
+`project-rag-cli` depends on [oudeis01/project-rag](https://github.com/oudeis01/project-rag), a fork of [Brainwires/project-rag](https://github.com/Brainwires/project-rag). Two changes in the fork are intentional design decisions that diverge from upstream:
+
+| Change | Upstream | This fork | Reason |
+|--------|----------|-----------|--------|
+| Default embedding model | `all-MiniLM-L6-v2` (384d, general-purpose) | `jinaai/jina-embeddings-v2-base-code` (768d, code-specific) | MiniLM produced 0.014-0.016 scores with no discrimination; jina produces 0.44-0.60 with real semantic ranking on code |
+| GPU acceleration | Silent CPU fallback via `error_on_failure=false` | Explicit CUDA ExecutionProvider registration | Eliminates silent GPU failure; 2x+ indexing speedup on CUDA hardware |
+
+Two additional changes are bug fixes being submitted upstream as PRs: tracing logs redirected to stderr (stdout is reserved for MCP JSON-RPC), and glob-based file exclusion patterns replacing broken substring matching.
+
 ## Install
 
 ```bash
