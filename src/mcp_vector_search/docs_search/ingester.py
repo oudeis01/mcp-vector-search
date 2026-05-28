@@ -1,4 +1,5 @@
 import hashlib
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -13,11 +14,18 @@ from qdrant_client.models import (
     VectorParams,
 )
 
+from .._registry import (
+    Project,
+    ProjectExistsError,
+    ProjectNotRegisteredError,
+    ProjectRegistry,
+)
 from . import config
 from .chunker import chunk_text
 from .embedder import Embedder
 
 _embedder: Embedder | None = None
+_registry: ProjectRegistry | None = None
 
 
 def _get_embedder() -> Embedder:
@@ -27,14 +35,40 @@ def _get_embedder() -> Embedder:
     return _embedder
 
 
+def _get_registry() -> ProjectRegistry:
+    global _registry
+    if _registry is None:
+        _registry = ProjectRegistry("docs")
+        _maybe_nuke_orphans(_registry)
+    return _registry
+
+
+def _maybe_nuke_orphans(registry: ProjectRegistry) -> None:
+    """On first boot, drop all docs__* Qdrant collections (test-only data).
+
+    A marker file inside the registry data dir guards against re-runs. If
+    Qdrant is unreachable the marker is NOT written, so the nuke is retried
+    next time the registry is initialized.
+    """
+    marker = registry.first_boot_marker()
+    if marker.exists():
+        return
+    try:
+        client = QdrantClient(url=config.QDRANT_URL)
+        for c in client.get_collections().collections:
+            if c.name.startswith(config.COLLECTION_PREFIX):
+                client.delete_collection(c.name)
+                print(f"[docs-search] nuked orphan collection: {c.name}", file=sys.stderr)
+        marker.write_text(str(int(time.time())))
+    except Exception as e:
+        print(f"[docs-search] orphan nuke deferred (Qdrant unreachable: {e})", file=sys.stderr)
+
+
 def _collection_name(project: str) -> str:
     return f"{config.COLLECTION_PREFIX}{project}"
 
 
 def _matches_patterns(path: Path, root: Path, patterns: list[str]) -> bool:
-    # Path.match() supports ** recursive globs (Python 3.12+).
-    # We test against both the full relative path and the filename alone
-    # so that plain patterns like "*.md" work without a leading "**/" prefix.
     rel = path.relative_to(root)
     return any(rel.match(p) or path.match(p) for p in patterns)
 
@@ -66,12 +100,69 @@ def _ensure_collection(client: QdrantClient, name: str) -> None:
     )
 
 
+def _project_to_dict(p: Project, points_count: int | None = None) -> dict:
+    out = {
+        "project": p.slug,
+        "abs_path": p.abs_path,
+        "description": p.description,
+        "created_at": p.created_at,
+        "last_indexed_at": p.last_indexed_at,
+    }
+    if points_count is not None:
+        out["points_count"] = points_count
+    return out
+
+
+def create_project(slug: str, abs_path: str, description: str | None = None) -> dict:
+    registry = _get_registry()
+    p = registry.create(slug, abs_path, description)
+    return _project_to_dict(p, points_count=0)
+
+
+def list_projects() -> list[dict]:
+    registry = _get_registry()
+    projects = registry.list_all()
+    if not projects:
+        return []
+    try:
+        client = QdrantClient(url=config.QDRANT_URL)
+        existing = {c.name for c in client.get_collections().collections}
+        counts: dict[str, int] = {}
+        for p in projects:
+            name = _collection_name(p.slug)
+            if name in existing:
+                info = client.get_collection(name)
+                counts[p.slug] = info.points_count or 0
+            else:
+                counts[p.slug] = 0
+    except Exception:
+        counts = {p.slug: 0 for p in projects}
+    return [_project_to_dict(p, counts.get(p.slug, 0)) for p in projects]
+
+
+def resolve_project_from_path(path: str) -> dict | None:
+    registry = _get_registry()
+    p = registry.resolve_from_path(path)
+    if p is None:
+        return None
+    return _project_to_dict(p)
+
+
+def update_project_description(slug: str, description: str | None) -> dict:
+    registry = _get_registry()
+    p = registry.update_description(slug, description)
+    return _project_to_dict(p)
+
+
 def ingest(
     project: str,
     directory: str,
     include_patterns: list[str],
     exclude_patterns: list[str],
 ) -> dict:
+    registry = _get_registry()
+    registry.get(project)
+
     client = QdrantClient(url=config.QDRANT_URL)
     collection = _collection_name(project)
     _ensure_collection(client, collection)
@@ -95,8 +186,6 @@ def ingest(
         if not chunks:
             continue
 
-        # Drop chunks whose content we've already indexed this run. Duplicate files in
-        # the corpus would otherwise flood results with identical chunks.
         unique_chunks = []
         for c in chunks:
             h = hashlib.sha256(c.encode("utf-8")).hexdigest()
@@ -137,6 +226,7 @@ def ingest(
         total_files += 1
 
     duration_ms = int((time.time() - start) * 1000)
+    registry.touch_indexed(project)
     return {
         "project": project,
         "files_indexed": total_files,
@@ -154,6 +244,9 @@ def search(
     hybrid: bool = config.DEFAULT_HYBRID,
 ) -> list[dict]:
     from qdrant_client.models import FusionQuery, Fusion, Prefetch
+
+    registry = _get_registry()
+    registry.get(project)
 
     client = QdrantClient(url=config.QDRANT_URL)
     collection = _collection_name(project)
@@ -198,29 +291,35 @@ def search(
     ]
 
 
-def list_projects(client: QdrantClient | None = None) -> list[dict]:
-    if client is None:
-        client = QdrantClient(url=config.QDRANT_URL)
-    collections = client.get_collections().collections
-    projects = []
-    for c in collections:
-        if not c.name.startswith(config.COLLECTION_PREFIX):
-            continue
-        slug = c.name[len(config.COLLECTION_PREFIX):]
-        info = client.get_collection(c.name)
-        projects.append({
-            "project": slug,
-            "collection": c.name,
-            "points_count": info.points_count,
-        })
-    return projects
-
-
 def delete_project(project: str) -> dict:
+    registry = _get_registry()
+    try:
+        registry.get(project)
+    except ProjectNotRegisteredError:
+        return {"success": False, "message": f"Project '{project}' is not registered."}
+
     client = QdrantClient(url=config.QDRANT_URL)
     collection = _collection_name(project)
     existing = {c.name for c in client.get_collections().collections}
-    if collection not in existing:
-        return {"success": False, "message": f"Project '{project}' not found."}
-    client.delete_collection(collection)
-    return {"success": True, "message": f"Project '{project}' deleted."}
+    collection_dropped = collection in existing
+    if collection_dropped:
+        client.delete_collection(collection)
+    registry.delete(project)
+    return {
+        "success": True,
+        "message": f"Project '{project}' deleted.",
+        "collection_dropped": collection_dropped,
+    }
+
+
+__all__ = [
+    "create_project",
+    "delete_project",
+    "ingest",
+    "list_projects",
+    "resolve_project_from_path",
+    "search",
+    "update_project_description",
+    "ProjectExistsError",
+    "ProjectNotRegisteredError",
+]

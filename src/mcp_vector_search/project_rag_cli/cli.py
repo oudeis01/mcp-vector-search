@@ -1,78 +1,33 @@
 """CLI wrapper for project-rag MCP server.
 
 Communicates with the project-rag binary via MCP JSON-RPC over stdio.
+
+This is a raw passthrough: it does NOT enforce the project registry. For
+project-isolated access (the recommended path for agents) use code-search-cli /
+code-search-mcp instead.
 """
 
 import asyncio
-import glob
 import json
-import os
-import shutil
 from typing import Annotated
 
 import typer
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 
-app = typer.Typer(help="project-rag-cli: trigger project-rag indexing and search from the terminal.")
+from .._rag_runtime import BinaryNotFoundError, call_tool, check_binary
 
-_BINARY = "project-rag"
-
-def _find_ort_cuda_dir() -> str | None:
-    """Locate the directory holding ort's CUDA execution provider shared library.
-
-    ort-sys downloads the ONNX Runtime into a per-target, per-hash cache directory, so
-    the path is not stable across machines or versions. Honor an explicit override, then
-    fall back to scanning the cache for the directory that actually contains the .so.
-    """
-    override = os.environ.get("PROJECT_RAG_ORT_LIB_DIR")
-    if override:
-        return override if os.path.isdir(override) else None
-    base = os.path.expanduser("~/.cache/ort.pyke.io/dfbin")
-    matches = glob.glob(os.path.join(base, "*", "*", "libonnxruntime_providers_cuda.so"))
-    return os.path.dirname(matches[0]) if matches else None
-
-
-def _build_env() -> dict:
-    # Default RUST_LOG to off, but respect an explicit value if the caller set one.
-    env = {**os.environ}
-    env.setdefault("RUST_LOG", "off")
-
-    lib_dirs = []
-    ort_cuda_dir = _find_ort_cuda_dir()
-    if ort_cuda_dir:
-        lib_dirs.append(ort_cuda_dir)
-    cuda_lib = os.environ.get("CUDA_LIB_DIR", "/opt/cuda/targets/x86_64-linux/lib")
-    if os.path.isdir(cuda_lib):
-        lib_dirs.append(cuda_lib)
-
-    # If neither is found we leave LD_LIBRARY_PATH untouched; the binary still runs on CPU.
-    combined = ":".join(filter(None, [*lib_dirs, env.get("LD_LIBRARY_PATH", "")]))
-    if combined:
-        env["LD_LIBRARY_PATH"] = combined
-    return env
-
-_ENV = _build_env()
+app = typer.Typer(help="project-rag-cli: raw passthrough to project-rag (no project enforcement).")
 
 
 def _check_binary() -> None:
-    if not shutil.which(_BINARY):
-        typer.echo(f"Error: '{_BINARY}' not found in PATH. Build and install it first.", err=True)
+    try:
+        check_binary()
+    except BinaryNotFoundError as e:
+        typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
 
 
 async def _call_tool(tool: str, args: dict) -> str:
-    params = StdioServerParameters(command=_BINARY, args=["serve"], env=_ENV)
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(tool, args)
-            # result.content is a list of TextContent / other content blocks
-            parts = []
-            for block in result.content:
-                if hasattr(block, "text"):
-                    parts.append(block.text)
-            return "\n".join(parts)
+    return await call_tool(tool, args)
 
 
 @app.command()

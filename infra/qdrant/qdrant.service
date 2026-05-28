@@ -1,0 +1,17 @@
+[Unit]
+Description=Qdrant vector database for mcp-vector-search (docker compose)
+# Depends on the system docker daemon. User units cannot directly require
+# system services, so we rely on Restart=on-failure to retry until docker is up.
+
+[Service]
+Type=simple
+WorkingDirectory=/home/choiharam/works/mcp-vector-search/infra/qdrant
+ExecStartPre=-/usr/bin/docker compose down
+ExecStart=/usr/bin/docker compose up
+ExecStop=/usr/bin/docker compose down
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

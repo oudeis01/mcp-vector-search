@@ -13,11 +13,14 @@ dependencies = [
     "mcp>=1.0",
     "sentence-transformers>=3.0",
     "onnxruntime>=1.20",
+    "platformdirs>=4.0",
 ]
 
 [project.scripts]
 docs-search = "mcp_vector_search.docs_search.cli:app"
 docs-search-mcp = "mcp_vector_search.docs_search.server:main"
+code-search-cli = "mcp_vector_search.code_search.cli:app"
+code-search-mcp = "mcp_vector_search.code_search.server:main"
 project-rag-cli = "mcp_vector_search.project_rag_cli.cli:app"
 
 [build-system]
