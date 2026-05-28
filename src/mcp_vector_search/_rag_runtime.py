@@ -34,9 +34,14 @@ def find_ort_cuda_dir() -> str | None:
 
 
 def build_env() -> dict:
-    """Build the env for spawning project-rag: silences logs, injects CUDA libs."""
+    """Build the env for spawning project-rag: keeps warnings, injects CUDA libs.
+
+    RUST_LOG defaults to 'warn' so EP-registration failures and other ort
+    warnings surface on stderr. With 'off', silent CPU fallback (the symptom
+    that prompted this helper to gain a cwd argument) is invisible to operators.
+    """
     env = {**os.environ}
-    env.setdefault("RUST_LOG", "off")
+    env.setdefault("RUST_LOG", "warn")
 
     lib_dirs = []
     ort_cuda_dir = find_ort_cuda_dir()
@@ -69,9 +74,17 @@ async def call_tool(tool: str, args: dict, env: dict | None = None) -> str:
     A new process is spawned per call. The binary's startup cost is non-trivial
     (model load + CUDA init) but acceptable for the wrapper's use case; if it
     becomes a bottleneck we can switch to a long-lived session.
+
+    cwd is set to the ort dfbin directory so the statically-linked onnxruntime
+    can dlopen sibling provider shared libraries (libonnxruntime_providers_shared.so,
+    libonnxruntime_providers_cuda.so). Without this, ORT looks in the parent's
+    cwd, fails to find the provider .so, and silently falls back to CPU.
     """
     check_binary()
-    params = StdioServerParameters(command=BINARY, args=["serve"], env=env or build_env())
+    cwd = find_ort_cuda_dir()
+    params = StdioServerParameters(
+        command=BINARY, args=["serve"], env=env or build_env(), cwd=cwd
+    )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
